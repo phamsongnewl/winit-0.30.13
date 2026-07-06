@@ -1,6 +1,6 @@
 [package]
 name = "dpi"
-version = "0.1.1"
+version = "0.1.2"
 description = "Types for handling UI scaling"
 keywords = ["DPI", "HiDPI", "scale-factor"]
 categories = ["gui"]
@@ -10,6 +10,8 @@ license.workspace = true
 edition.workspace = true
 
 [features]
+default = ["std"]
+std = []
 serde = ["dep:serde"]
 mint = ["dep:mint"]
 

@@ -168,14 +168,53 @@ impl KeyEventBuilder {
                 WM_CHAR | WM_SYSCHAR => {
                     let mut event_info = self.event_info.lock().unwrap();
                     if event_info.is_none() {
+                        // Unikey and some third-party IMEs send WM_CHAR with the
+                        // composed character WITHOUT a preceding WM_KEYDOWN. Winit
+                        // normally drops these. Instead, create a synthetic key event
+                        // so the character is delivered to the application.
+                        let is_high_surrogate = (0xd800..=0xdbff).contains(&wparam);
+                        let is_low_surrogate = (0xdc00..=0xdfff).contains(&wparam);
+                        eprintln!("[WINIT_PATCH] WM_CHAR wparam=0x{wparam:04X} event_info=None surrogate_hi={is_high_surrogate} surrogate_lo={is_low_surrogate}");
+                        if is_high_surrogate || is_low_surrogate {
+                            trace!(
+                                "Received a surrogate CHAR message (IME) but no event_info — \
+                                 cannot handle surrogate pairs from IME, returning."
+                            );
+                            return MatchResult::Nothing;
+                        }
+                        if let Some(ch) = char::from_u32(wparam as u32) {
+                            let pending_token = self.pending.add_pending();
+                            *result = ProcResult::Value(0);
+                            let key_text = SmolStr::new(ch.to_string());
+                            let ev = KeyEvent {
+                                physical_key: PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+                                logical_key: Key::Character(key_text.clone()),
+                                text: Some(key_text.clone()),
+                                location: KeyLocation::Standard,
+                                state: ElementState::Pressed,
+                                repeat: false,
+                                platform_specific: KeyEventExtra {
+                                    text_with_all_modifiers: Some(key_text.clone()),
+                                    key_without_modifiers: Key::Character(key_text),
+                                },
+                            };
+                            return MatchResult::MessagesToDispatch(
+                                self.pending
+                                    .complete_pending(pending_token, MessageAsKeyEvent {
+                                        event: ev,
+                                        is_synthetic: true,
+                                    }),
+                            );
+                        }
                         trace!(
-                            "Received a CHAR message but no `event_info` was available. The \
-                             message is probably IME, returning."
+                            "Received a CHAR message (IME) but could not decode wparam — returning."
                         );
                         return MatchResult::Nothing;
                     }
+
                     let pending_token = self.pending.add_pending();
                     *result = ProcResult::Value(0);
+                    eprintln!("[WINIT_PATCH] WM_CHAR wparam=0x{wparam:04X} event_info=Some");
                     let is_high_surrogate = (0xd800..=0xdbff).contains(&wparam);
                     let is_low_surrogate = (0xdc00..=0xdfff).contains(&wparam);
 
@@ -202,6 +241,20 @@ impl KeyEventBuilder {
                             let encode_len = ch.encode_utf16(&mut utf16parts[start_offset..]).len();
                             let new_size = start_offset + encode_len;
                             utf16parts.resize(new_size, 0);
+                            // When a third-party IME (e.g. Unikey) sends WM_CHAR with a
+                            // printable character via an unknown virtual key, the logical_key
+                            // is Unidentified. Override to TextOr so the character wins.
+                            if !ch.is_control() {
+                                if let Some(ev_info) = event_info.as_mut() {
+                                    if !matches!(ev_info.logical_key, PartialLogicalKey::TextOr(_)) {
+                                        let fallback = match ev_info.logical_key {
+                                            PartialLogicalKey::This(ref k) => k.clone(),
+                                            _ => Key::Unidentified(NativeKey::Unidentified),
+                                        };
+                                        ev_info.logical_key = PartialLogicalKey::TextOr(fallback);
+                                    }
+                                }
+                            }
                         }
                     }
                     // It's important that we unlock the mutex, and create the pending event token
